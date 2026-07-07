@@ -1,44 +1,74 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { CanvasToolbar } from "./components/CanvasToolbar";
+import { ConnectionLayer } from "./components/ConnectionLayer";
+import { StickyNote } from "./components/StickyNote";
+import {
+  getCanvasPoint,
+  noteAnchor,
+  noteIdFromElement,
+} from "./utils/geometry";
+import {
+  type Connection,
+  type EditingField,
+  type Note,
+  type ToolMode,
+} from "./types";
 
-const defaultCards = [
+const DEFAULT_NOTES: Note[] = [
   {
     id: "1",
-    title: "Titel 1",
-    text: "Text 1",
-    color: "bg-blue-100",
-    x: 288,
-    y: 128,
+    x: 280,
+    y: 120,
+    title: "MVP",
+    description: "Erstmal Notes + Verbindungen. Rest später.",
   },
   {
     id: "2",
-    title: "Titel 2",
-    text: "Text 2",
-    color: "bg-green-100",
-    x: 448,
-    y: 224,
+    x: 480,
+    y: 220,
+    title: "Drag testen",
+    description: "Window-Level mouseup, damit nichts kleben bleibt.",
   },
   {
     id: "3",
-    title: "Titel 3",
-    text: "Titel 3",
-    color: "bg-amber-100",
-    x: 704,
-    y: 176,
+    x: 680,
+    y: 160,
+    title: "Sync?",
+    description: "Supabase vielleicht. @Timon fragen.",
   },
 ];
 
+type DragState = {
+  noteId: string;
+  offsetX: number;
+  offsetY: number;
+};
+
 export default function Home() {
-  const tools = ["Auswählen", "Neuer Eintrag", "Verbinden", "Löschen"];
+  const [activeTool, setActiveTool] = useState<ToolMode>("select");
+  const [notes, setNotes] = useState<Note[]>(DEFAULT_NOTES);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [editingField, setEditingField] = useState<EditingField | null>(null);
+  const [dragging, setDragging] = useState<DragState | null>(null);
+  const [connectingFromId, setConnectingFromId] = useState<string | null>(null);
+  const [snapTargetId, setSnapTargetId] = useState<string | null>(null);
+  const [previewEnd, setPreviewEnd] = useState<{ x: number; y: number } | null>(
+    null
+  );
 
-  const [activeTool, setActiveTool] = useState("Auswählen");
-  const [cards, setCards] = useState(defaultCards);
-  const [editing, setEditing] = useState<{ id: string; field: "title" | "text" } | null>(null);
-  const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
-
-  const mainRef = useRef<HTMLElement>(null);
+  const canvasRef = useRef<HTMLElement>(null);
+  const draggingRef = useRef<DragState | null>(null);
+  const connectingFromRef = useRef<string | null>(null);
+  const snapTargetRef = useRef<string | null>(null);
+  const notesRef = useRef(notes);
   const movedWhileDragging = useRef(false);
+
+  draggingRef.current = dragging;
+  connectingFromRef.current = connectingFromId;
+  snapTargetRef.current = snapTargetId;
+  notesRef.current = notes;
 
   const users = [
     { initial: "A", color: "bg-blue-500" },
@@ -46,64 +76,170 @@ export default function Home() {
     { initial: "C", color: "bg-amber-500" },
   ];
 
-  function patchCard(id: string, field: "title" | "text", value: string) {
-    setCards((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, [field]: value } : c))
+  const patchNote = useCallback((id: string, patch: Partial<Note>) => {
+    setNotes((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, ...patch } : n))
     );
-  }
+  }, []);
 
-  function stopEditing() {
-    setEditing(null);
-  }
+  const deleteNote = useCallback((id: string) => {
+    setNotes((prev) => prev.filter((n) => n.id !== id));
+    setConnections((prev) =>
+      prev.filter((c) => c.fromNoteId !== id && c.toNoteId !== id)
+    );
+    setEditingField((current) =>
+      current?.noteId === id ? null : current
+    );
+  }, []);
 
-  const isEditing = (id: string, field: "title" | "text") =>
-    editing?.id === id && editing.field === field;
+  const addConnection = useCallback((fromNoteId: string, toNoteId: string) => {
+    if (fromNoteId === toNoteId) return;
 
-  function startDrag(e: React.MouseEvent, cardId: string) {
-    if (activeTool !== "Auswählen" || editing) return;
+    setConnections((prev) => {
+      const exists = prev.some(
+        (c) =>
+          (c.fromNoteId === fromNoteId && c.toNoteId === toNoteId) ||
+          (c.fromNoteId === toNoteId && c.toNoteId === fromNoteId)
+      );
+      if (exists) return prev;
 
-    const main = mainRef.current;
-    if (!main) return;
+      return [
+        ...prev,
+        { id: crypto.randomUUID(), fromNoteId, toNoteId },
+      ];
+    });
+  }, []);
 
-    const card = cards.find((c) => c.id === cardId);
-    if (!card) return;
+  const handleCanvasMouseDown = (e: React.MouseEvent) => {
+    if (activeTool !== "create" || e.target !== e.currentTarget) return;
 
-    const rect = main.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    // Offset merken, damit die Karte beim Klicken nicht springt
+    const { x, y } = getCanvasPoint(e, canvas);
+    const id = crypto.randomUUID();
+
+    setNotes((prev) => [
+      ...prev,
+      { id, x, y, title: "", description: "" },
+    ]);
+    setEditingField({ noteId: id, field: "title" });
+  };
+
+  const handleNoteMouseDown = (e: React.MouseEvent, note: Note) => {
+    e.stopPropagation();
+    if (activeTool !== "select" || editingField) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const { x, y } = getCanvasPoint(e, canvas);
     setDragging({
-      id: cardId,
-      offsetX: e.clientX - rect.left - card.x,
-      offsetY: e.clientY - rect.top - card.y,
+      noteId: note.id,
+      offsetX: x - note.x,
+      offsetY: y - note.y,
     });
     movedWhileDragging.current = false;
-  }
+  };
 
-  function onCanvasMouseMove(e: React.MouseEvent) {
-    if (!dragging || !mainRef.current) return;
+  const handleAnchorMouseDown = (e: React.MouseEvent, noteId: string) => {
+    e.stopPropagation();
 
-    movedWhileDragging.current = true;
-    const rect = mainRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left - dragging.offsetX;
-    const y = e.clientY - rect.top - dragging.offsetY;
+    const note = notes.find((n) => n.id === noteId);
+    if (!note) return;
 
-    setCards((prev) =>
-      prev.map((c) => (c.id === dragging.id ? { ...c, x, y } : c))
-    );
-  }
+    const anchor = noteAnchor(note);
+    setConnectingFromId(noteId);
+    setPreviewEnd(anchor);
+    setSnapTargetId(null);
+  };
 
-  function stopDrag() {
-    // Drag-State zurücksetzen
-    setDragging(null);
-  }
+  // Window-Listener für Drag & Connect – mouseup feuert überall zuverlässig
+  useEffect(() => {
+    if (!dragging && !connectingFromId) return;
 
-  function tryEdit(id: string, field: "title" | "text") {
+    const onMove = (e: MouseEvent) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const point = getCanvasPoint(e, canvas);
+      const activeDrag = draggingRef.current;
+
+      if (activeDrag) {
+        movedWhileDragging.current = true;
+        patchNote(activeDrag.noteId, {
+          x: point.x - activeDrag.offsetX,
+          y: point.y - activeDrag.offsetY,
+        });
+        return;
+      }
+
+      const fromId = connectingFromRef.current;
+      if (!fromId) return;
+
+      const hoveredId = noteIdFromElement(document.elementFromPoint(e.clientX, e.clientY));
+      const hoveredNote = hoveredId
+        ? notesRef.current.find((n) => n.id === hoveredId)
+        : null;
+
+      if (hoveredNote && hoveredId !== fromId) {
+        setSnapTargetId(hoveredId);
+        setPreviewEnd(noteAnchor(hoveredNote));
+      } else {
+        setSnapTargetId(null);
+        setPreviewEnd(point);
+      }
+    };
+
+    const onUp = () => {
+      if (draggingRef.current) {
+        setDragging(null);
+      }
+
+      const fromId = connectingFromRef.current;
+      if (fromId) {
+        const toId = snapTargetRef.current;
+        if (toId && toId !== fromId) {
+          addConnection(fromId, toId);
+        }
+
+        setConnectingFromId(null);
+        setSnapTargetId(null);
+        setPreviewEnd(null);
+      }
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragging, connectingFromId, patchNote, addConnection]);
+
+  const tryStartEdit = (noteId: string, field: "title" | "description") => {
+    if (activeTool !== "select") return;
     if (movedWhileDragging.current) {
       movedWhileDragging.current = false;
       return;
     }
-    setEditing({ id, field });
-  }
+    setEditingField({ noteId, field });
+  };
+
+  const fromNote = connectingFromId
+    ? notes.find((n) => n.id === connectingFromId)
+    : null;
+
+  const previewLine =
+    fromNote && previewEnd
+      ? { from: noteAnchor(fromNote), to: previewEnd }
+      : null;
+
+  const shouldShowAnchor = (noteId: string) =>
+    activeTool === "connect" ||
+    connectingFromId !== null ||
+    snapTargetId === noteId;
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -124,85 +260,39 @@ export default function Home() {
       </nav>
 
       <main
-        ref={mainRef}
-        className="relative flex-1 overflow-hidden"
-        onMouseMove={onCanvasMouseMove}
-        onMouseUp={stopDrag}
-        onMouseLeave={stopDrag}
+        ref={canvasRef}
+        className={`relative flex-1 overflow-hidden ${
+          activeTool === "create" ? "cursor-crosshair" : ""
+        }`}
+        onMouseDown={handleCanvasMouseDown}
       >
-        <aside className="absolute top-6 left-6 z-10 bg-white rounded-xl shadow-md border border-slate-200 p-3 w-40">
-          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 px-2">
-            Tools
-          </p>
-          {tools.map((tool) => (
-            <button
-              key={tool}
-              onClick={() => setActiveTool(tool)}
-              className={`block w-full text-left px-3 py-2 text-sm rounded-lg transition-colors ${
-                activeTool === tool
-                  ? "bg-blue-100 text-blue-800 font-medium"
-                  : "text-slate-700 hover:bg-slate-100"
-              }`}
-            >
-              {tool}
-            </button>
-          ))}
-        </aside>
+        <CanvasToolbar activeTool={activeTool} onToolChange={setActiveTool} />
 
-        {cards.map((card) => (
-          <div
-            key={card.id}
-            style={{ left: card.x, top: card.y }}
-            onMouseDown={(e) => startDrag(e, card.id)}
-            className={`absolute w-56 ${card.color} rounded-xl shadow-md p-4 border border-white/60 select-none ${
-              activeTool === "Auswählen" ? "cursor-grab active:cursor-grabbing" : ""
-            } ${dragging?.id === card.id ? "cursor-grabbing shadow-lg" : ""}`}
-          >
-            {/* quick inline edit */}
-            {isEditing(card.id, "title") ? (
-              <input
-                autoFocus
-                value={card.title}
-                onChange={(e) => patchCard(card.id, "title", e.target.value)}
-                onBlur={stopEditing}
-                onKeyDown={(e) => e.key === "Enter" && stopEditing()}
-                onMouseDown={(e) => e.stopPropagation()}
-                className="w-full font-semibold text-slate-800 mb-1 bg-white/60 rounded px-1 outline-none ring-1 ring-blue-300"
-              />
-            ) : (
-              <h3
-                onClick={() => tryEdit(card.id, "title")}
-                className="font-semibold text-slate-800 mb-1 cursor-text hover:ring-1 hover:ring-blue-200 rounded px-1 -mx-1"
-              >
-                {card.title}
-              </h3>
-            )}
+        <ConnectionLayer
+          notes={notes}
+          connections={connections}
+          previewLine={previewLine}
+        />
 
-            {isEditing(card.id, "text") ? (
-              <textarea
-                autoFocus
-                value={card.text}
-                onChange={(e) => patchCard(card.id, "text", e.target.value)}
-                onBlur={stopEditing}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    stopEditing();
-                  }
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-                rows={3}
-                className="w-full text-sm text-slate-600 leading-relaxed bg-white/60 rounded px-1 outline-none ring-1 ring-blue-300 resize-none"
-              />
-            ) : (
-              <p
-                onClick={() => tryEdit(card.id, "text")}
-                className="text-sm text-slate-600 leading-relaxed cursor-text hover:ring-1 hover:ring-blue-200 rounded px-1 -mx-1"
-              >
-                {card.text}
-              </p>
-            )}
-          </div>
+        {notes.map((note) => (
+          <StickyNote
+            key={note.id}
+            note={note}
+            activeTool={activeTool}
+            isDragging={dragging?.noteId === note.id}
+            editingField={editingField}
+            showAnchor={shouldShowAnchor(note.id)}
+            isSnapTarget={snapTargetId === note.id}
+            onMouseDown={(e) => handleNoteMouseDown(e, note)}
+            onAnchorMouseDown={(e) => handleAnchorMouseDown(e, note.id)}
+            onDelete={() => deleteNote(note.id)}
+            onTitleChange={(title) => patchNote(note.id, { title })}
+            onDescriptionChange={(description) =>
+              patchNote(note.id, { description })
+            }
+            onStartEdit={(field) => tryStartEdit(note.id, field)}
+            onStopEdit={() => setEditingField(null)}
+          />
         ))}
       </main>
     </div>
