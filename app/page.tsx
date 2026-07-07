@@ -9,6 +9,7 @@ import {
   noteAnchor,
   noteIdFromElement,
 } from "./utils/geometry";
+import { loadCanvasData, saveCanvasData } from "./utils/storage";
 import {
   type Connection,
   type EditingField,
@@ -50,6 +51,7 @@ export default function Home() {
   const [activeTool, setActiveTool] = useState<ToolMode>("select");
   const [notes, setNotes] = useState<Note[]>(DEFAULT_NOTES);
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [isHydrated, setIsHydrated] = useState(false);
   const [editingField, setEditingField] = useState<EditingField | null>(null);
   const [dragging, setDragging] = useState<DragState | null>(null);
   const [connectingFromId, setConnectingFromId] = useState<string | null>(null);
@@ -69,6 +71,27 @@ export default function Home() {
   connectingFromRef.current = connectingFromId;
   snapTargetRef.current = snapTargetId;
   notesRef.current = notes;
+
+  // Beim Mount: gespeicherte Daten aus localStorage laden (nur Client)
+  useEffect(() => {
+    const saved = loadCanvasData();
+    if (saved) {
+      setNotes(saved.notes);
+      setConnections(saved.connections);
+    }
+    setIsHydrated(true);
+  }, []);
+
+  // Änderungen persistieren – leicht debounced, damit Drag nicht ständig schreibt
+  useEffect(() => {
+    if (!isHydrated) return;
+
+    const timeout = setTimeout(() => {
+      saveCanvasData({ notes, connections });
+    }, 300);
+
+    return () => clearTimeout(timeout);
+  }, [notes, connections, isHydrated]);
 
   const users = [
     { initial: "A", color: "bg-blue-500" },
